@@ -1,72 +1,78 @@
 import requests
 import pandas as pd
 import time
+import re
 from bs4 import BeautifulSoup
 
 class EdgarBot:
     def __init__(self):
         self.base_url = "https://data.sec.gov"
+        self.edgar_url = "https://www.sec.gov"
         self.headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
     
     def get_company_list(self):
-        """Fetch list of all public companies with CIK numbers"""
+        """Fetch list of all public companies with CIK numbers and tickers"""
         try:
             url = "https://www.sec.gov/files/company_tickers.json"
             response = requests.get(url, headers=self.headers)
             response.raise_for_status()
             companies = response.json()
-            return [(comp['cik_str'], comp['title']) for comp in companies.values()]
+            return [(comp['cik_str'], comp['title'], comp['ticker']) for comp in companies.values()]
         except Exception as e:
             print(f"Error fetching company list: {e}")
             return []
     
     def get_company_facts(self, cik):
-        """Get revenue and employee data for a specific company by CIK"""
+        """Try XBRL API for revenue"""
         try:
             url = f"{self.base_url}/api/xbrl/companyfacts/CIK{cik:010d}.json"
             response = requests.get(url, headers=self.headers)
             response.raise_for_status()
             facts = response.json()
             
-            # Extract latest revenue (e.g., 'Revenues' or 'SalesRevenueNet')
             revenue = None
-            employee_count = None
+            revenue_tags = [
+                'Revenues', 
+                'SalesRevenueNet', 
+                'RevenueFromContractWithCustomerExcludingAssessedTax',
+                'TotalRevenue'
+            ]
+            for tag in revenue_tags:
+                if 'us-gaap' in facts['facts'] and tag in facts['facts']['us-gaap']:
+                    rev_data = facts['facts']['us-gaap'][tag]['units'].get('USD', [])
+                    if rev_data:
+                        revenue = sorted(rev_data, key=lambda x: x['end'])[-1]['val']
+                        break
             
-            # Look for revenue in facts
-            for concept in ['Revenues', 'SalesRevenueNet', 'RevenueFromContractWithCustomerExcludingAssessedTax']:
-                if concept in facts['facts'].get('us-gaap', {}):
-                    rev_data = facts['facts']['us-gaap'][concept]['units']['USD']
-                    revenue = sorted(rev_data, key=lambda x: x['end'])[-1]['val']  # Latest value
-                    break
-            
-            # Look for employee count
-            if 'NumberOfEmployees' in facts['facts'].get('us-gaap', {}):
-                emp_data = facts['facts']['us-gaap']['NumberOfEmployees']['units']['pure']
-                employee_count = sorted(emp_data, key=lambda x: x['end'])[-1]['val']
-            
-            return revenue, employee_count
+            return revenue, facts['entityName']
         except Exception as e:
-            print(f"Error fetching data for CIK {cik}: {e}")
+            print(f"Error fetching XBRL data for CIK {cik}: {e}")
             return None, None
     
+    def get_company_data(self, cik, name, ticker):
+        """Get company data including revenue and ticker"""
+        revenue, entity_name = self.get_company_facts(cik)
+        print(f"{name} (CIK {cik}, Ticker {ticker}): Revenue = {revenue}")
+        return revenue, ticker
+    
     def scrape_all_companies(self, limit=None):
-        """Scrape data for all companies (or up to a limit)"""
+        """Scrape data for all companies"""
         companies = self.get_company_list()
         if not companies:
             return None
         
         data = []
-        for i, (cik, name) in enumerate(companies[:limit]):
+        for i, (cik, name, ticker) in enumerate(companies[:limit]):
             print(f"Fetching data for {name} ({i+1}/{len(companies[:limit])})...")
-            revenue, employees = self.get_company_facts(cik)
-            if revenue or employees:
+            revenue, ticker = self.get_company_data(cik, name, ticker)
+            if revenue or ticker:
                 data.append({
                     'Company': name,
                     'CIK': cik,
-                    'Revenue': revenue,
-                    'Employees': employees
+                    'Ticker': ticker,
+                    'Revenue': revenue if revenue is not None else 'Not Found'
                 })
-            time.sleep(1)  # Rate limiting (SEC allows 10 requests/sec, but let’s be safe)
+            time.sleep(1)  # Rate limiting
         
         df = pd.DataFrame(data)
         return df
@@ -79,9 +85,8 @@ class EdgarBot:
 def main():
     bot = EdgarBot()
     
-    # Scrape data (limit to 50 companies for testing; remove limit for all)
     print("Scraping SEC EDGAR for company data...")
-    df = bot.scrape_all_companies(limit=50)  # Set limit=None for all companies
+    df = bot.scrape_all_companies()  # Test with 10
     
     if df is not None:
         bot.save_to_csv(df, 'edgar_company_data.csv')
